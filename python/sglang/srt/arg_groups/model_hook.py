@@ -40,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_gfx95_supported,
     is_mps,
     parse_connector_type,
 )
@@ -134,6 +135,26 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
     if dtype is not None and dtype != "F8_E4M3":
         flag.set(False)
         logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
+
+
+def _default_rocm_mla_qkv_a_norm(hf_config: Any) -> None:
+    """Turn on the fused MLA qkv_a GEMM + RMSNorm for GLM-5.2 on gfx950.
+
+    The kernels use gfx950 MFMA and are validated on GLM-5.2's MLA shapes only,
+    so other models keep them off unless the user sets the flag explicitly.
+    """
+    from sglang.srt.configs.model_config import is_glm_moe_dsa
+
+    if (
+        is_glm_moe_dsa(hf_config)
+        and is_gfx95_supported()
+        and not envs.SGLANG_ROCM_MLA_QKV_A_NORM.is_set()
+    ):
+        envs.SGLANG_ROCM_MLA_QKV_A_NORM.set(True)
+        logger.info(
+            "Enable fused MLA qkv_a GEMM + RMSNorm for GLM-5.2 decode "
+            "(SGLANG_ROCM_MLA_QKV_A_NORM=1)"
+        )
 
 
 def handle_model_specific_adjustments(server_args: Any):
@@ -404,6 +425,7 @@ def handle_model_specific_adjustments(server_args: Any):
             if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 # Prefer HIP top-k by default while honoring an explicit selection.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            _default_rocm_mla_qkv_a_norm(hf_config)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True

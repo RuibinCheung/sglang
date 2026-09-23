@@ -57,6 +57,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_hip,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -139,6 +140,61 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+if _is_hip:
+    from sglang.kernels.ops.attention.mla_qkv_a_norm_gfx950 import (
+        MAX_M as _MLA_QKV_A_NORM_MAX_M,
+    )
+    from sglang.kernels.ops.attention.mla_qkv_a_norm_gfx950 import (
+        mla_qkv_a_norm,
+    )
+else:
+    _MLA_QKV_A_NORM_MAX_M = 0
+
+
+def _mla_qkv_a_norm_static_ok(attn: DeepseekV2AttentionMLA) -> bool:
+    """Forward-invariant half of the fused qkv_a GEMM + RMSNorm gate."""
+    if not (
+        _is_hip
+        and _is_gfx95_supported
+        and envs.SGLANG_ROCM_MLA_QKV_A_NORM.get()
+        and attn.has_fused_proj
+    ):
+        return False
+    weight = attn.fused_qkv_a_proj_with_mqa.weight
+    return (
+        weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        # The kernel applies one epsilon to both latent norms.
+        and attn.q_a_layernorm.variance_epsilon == attn.kv_a_layernorm.variance_epsilon
+        and not getattr(attn.fused_qkv_a_proj_with_mqa, "set_lora", False)
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _mla_qkv_a_norm_eligible(
+    attn: DeepseekV2AttentionMLA,
+    hidden_states,
+    forward_batch: ForwardBatch,
+    q_replicate_active: bool,
+) -> bool:
+    """Whether this forward can use the fused qkv_a GEMM + RMSNorm kernel."""
+    if attn._mla_qkv_a_norm_static_ok is None:
+        attn._mla_qkv_a_norm_static_ok = _mla_qkv_a_norm_static_ok(attn)
+    if not attn._mla_qkv_a_norm_static_ok:
+        return False
+    mode = forward_batch.forward_mode
+    return (
+        (mode.is_decode_or_idle() or mode.is_target_verify())
+        and isinstance(hidden_states, torch.Tensor)
+        and hidden_states.dim() == 2
+        and 1 <= hidden_states.shape[0] <= _MLA_QKV_A_NORM_MAX_M
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and not q_replicate_active
+        and not is_in_tc_piecewise_cuda_graph()
+        and not get_attn_tp_context().input_scattered
+    )
 
 
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
@@ -396,79 +452,95 @@ class DeepseekMLARocmForwardMixin:
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
-            )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                q, _, k_nope, *_ = fused_rms_mxfp4_quant(
-                    q,
+            latent_cache = None
+            if _mla_qkv_a_norm_eligible(
+                self, hidden_states, forward_batch, q_replicate_active
+            ):
+                # Replaces the qkv_a GEMM in fetch_qkv_latent() and both norms.
+                q, k_nope, k_pe_raw = mla_qkv_a_norm(
+                    hidden_states,
+                    self.fused_qkv_a_proj_with_mqa.weight,
                     self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    k_nope,
                     self.kv_a_layernorm.weight,
-                    self.kv_a_layernorm.variance_epsilon,
-                )
-            elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
-                if self.use_dsa:
-                    q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                        group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
-                        res1=None,
-                        output_unquantized_inp1=True,
-                        transpose_scale=False,
-                    )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
-                    q = q_quanted
-                else:
-                    q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                        group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
-                        res1=None,
-                        output_unquantized_inp1=False,
-                        transpose_scale=False,
-                    )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q = materialize_bpreshuffle_fp8_scale_tuple(q)
-            elif _use_aiter:
-                q, k_nope = fused_qk_rmsnorm_bf16(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    k_nope,
-                    self.kv_a_layernorm.weight,
-                    self.kv_a_layernorm.variance_epsilon,
+                    rope_dim=self.qk_rope_head_dim,
+                    eps=self.q_a_layernorm.variance_epsilon,
                 )
             else:
-                q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
+                q, latent_cache = (
+                    get_attn_tp_context()
+                    .fetch_qkv_latent()
+                    .split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                )
+                k_nope = latent_cache[..., : self.kv_lora_rank]
+
+                # overlap qk norm
+                if self.alt_stream is not None and get_is_capture_mode():
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    q = self.q_a_layernorm(q)
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = self.kv_a_layernorm(k_nope)
+                    current_stream.wait_stream(self.alt_stream)
+                elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                    )
+                elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                    if self.use_dsa:
+                        q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=True,
+                            transpose_scale=False,
+                        )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
+                                q_quanted
+                            )
+                        q = q_quanted
+                    else:
+                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                            group_size=128,
+                            dtype_quant=torch.float8_e4m3fn,
+                            res1=None,
+                            output_unquantized_inp1=False,
+                            transpose_scale=False,
+                        )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            q = materialize_bpreshuffle_fp8_scale_tuple(q)
+                elif _use_aiter:
+                    q, k_nope = fused_qk_rmsnorm_bf16(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                    )
+                else:
+                    q = self.q_a_layernorm(q)
+                    k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -544,7 +616,13 @@ class DeepseekMLARocmForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+        if latent_cache is None:
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_pe = k_pe_raw.unsqueeze(1)
+        else:
+            q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         if q_replicate_active:
             q_nope_out = (

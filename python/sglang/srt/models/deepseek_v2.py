@@ -2164,6 +2164,7 @@ class DeepseekV2AttentionMLA(
             in {"awq", "awq_marlin", "moe_wna16"}
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
+        self._mla_qkv_a_norm_static_ok: bool | None = None
         self.fused_a_gemm_backend = "auto"
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")

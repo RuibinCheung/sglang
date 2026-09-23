@@ -901,6 +901,10 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Fuse the MLA q/kv-a projection with both latent RMSNorms for decode and
+    # verify batches of at most 16 rows on gfx950. The kernels are tuned on
+    # GLM-5.2's shapes; model_hook turns this on for GLM-5.2 unless it is set.
+    SGLANG_ROCM_MLA_QKV_A_NORM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
